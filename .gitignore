@@ -1,0 +1,9 @@
+*.exe
+*.ilk
+*.obj
+*.pdb
+*.swo
+*.swp
+build/Debug/
+build/Release/
+build/.vs/
