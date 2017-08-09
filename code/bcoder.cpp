@@ -16,9 +16,9 @@ InitializeBCoder() {
   BCoderState.ShowNumbers = false;
   BCoderState.CurrentPanel = &BCoderState.Panels[0];
   BCoderState.CurrentPanel->CommandBuffer = Platform.CreateEmptyBuffer(Kilobytes(1));
-  BCoderState.CurrentPanel->Buffer = GetBuffer("w:/test.c");
+  //BCoderState.CurrentPanel->Buffer = GetBuffer("w:/test.c");
   
-#if 0
+#if 1
   BCoderState.CurrentPanel->Buffer = GetBuffer(StartBufferName);
   StringCopy(BCoderState.CurrentPanel->Buffer->Name, StartBufferName);
   StringCopy((char *)BCoderState.CurrentPanel->Buffer->Memory, StartBufferContent);
