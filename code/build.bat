@@ -1,5 +1,5 @@
 @echo off
 mkdir ..\build
 pushd ..\build
-cl -nologo -Zi ..\code\bcoder_win32.cpp /DDEBUG gdi32.lib user32.lib
+cl -nologo -Zi ..\code\bcoder_win32.cpp /DDEBUG gdi32.lib user32.lib opengl32.lib
 popd

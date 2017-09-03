@@ -1,0 +1,7 @@
+#ifndef BCODER_CONFIG_H_
+
+#define BCODER_RENDERER_OS 1
+#define BCODER_RENDERER_OPENGL 0
+
+#define BCODER_CONFIG_H_
+#endif

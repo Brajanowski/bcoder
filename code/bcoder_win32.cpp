@@ -2,418 +2,253 @@
 // author: Brajan Bartoszewicz
 #include <windows.h>
 
+#include <GL/gl.h>
+
 #include "bcoder.h"
 #include "bcoder_string.h"
+#include "bcoder_config.h"
 
 // cpps
 #include "bcoder.cpp"
 #include "bcoder_string.cpp"
+#include "bcoder_lexer.cpp"
 
-// app data
+#if BCODER_RENDERER_OPENGL == 1
+#include "bcoder_renderer_opengl.cpp"
+#elif BCODER_RENDERER_OS == 1
+#include "bcoder_renderer_win32.cpp"
+#endif
+
+struct win32_window_dimensions {
+  int Width;
+  int Height;
+};
+
+struct win32_offscreen_buffer {
+  BITMAPINFO BitmapInfo;
+  bitmap Bitmap;
+};
+
+struct win32_opengl_context {
+  HDC DeviceContext;
+  HGLRC ContextHandle;
+  HWND WindowHandle;
+};
+
 global_variable bool IsExitRequested = false;
+global_variable HWND Win32Window = 0;
+global_variable win32_opengl_context OpenGLContext;
 
-global_variable HDC BackbufferDC;
-global_variable HBITMAP BackbufferBitmap;
-global_variable HFONT Font;
-global_variable HWND Win32Window;
+internal u8 *
+Win32GetFileContent(const char *FileName) {
+  HANDLE File = 0;
+  ULONG NumberRead = 0;
+  u8 *Data = 0;
+  u32 FileSize = 0;
 
-struct panel_graphics_win32 {
-  HDC Context;
-  HBITMAP Bitmap;
-};
-global_variable panel_graphics_win32 PanelsGraphicsWin32[MaxPanels];
-
-internal void
-Win32DrawRectangle(HDC DeviceContext, u32 X, u32 Y, u32 Width, u32 Height, rgb Color) {
-  HBRUSH Brush = CreateSolidBrush(RGB(Color.Red, Color.Green, Color.Blue));
-  RECT Rect = {
-    (LONG)X, (LONG)Y,
-    (LONG)X + (LONG)Width, (LONG)Y + (LONG)Height
-  };
-  FillRect(DeviceContext, &Rect, Brush);
-  DeleteObject(Brush);
-}
-
-internal void
-Win32DrawText(HDC DeviceContext, char *String, u32 Length, u32 X, u32 Y, rgb Color) {
-  SelectObject(DeviceContext, Font);
-  SetBkMode(DeviceContext, TRANSPARENT);
-  SetTextColor(DeviceContext, RGB(Color.Red, Color.Green, Color.Blue));
-  TextOutA(DeviceContext, X, Y, String, Length);  
-}
-
-internal void
-Win32ResizeDIBSection(HDC DeviceContext, u32 Width, u32 Height) {
-  if (!BackbufferDC) {
-    BackbufferDC = CreateCompatibleDC(0);
+  File = CreateFile(FileName, GENERIC_READ, FILE_SHARE_READ, 0, OPEN_EXISTING, 0, 0);
+  if (File == INVALID_HANDLE_VALUE) {
+    Assert(false);
+    return 0;
   }
 
-  if (BackbufferBitmap) {
-    DeleteObject(BackbufferBitmap);
-  }
+  FileSize = GetFileSize(File, 0);
+  Data = (u8 *)VirtualAlloc(0, FileSize, MEM_COMMIT, PAGE_READWRITE);
+  ReadFile(File, Data, FileSize, &NumberRead, 0);
   
-  BackbufferBitmap = CreateCompatibleBitmap(DeviceContext, Width, Height);
-  SelectObject(BackbufferDC, BackbufferBitmap);
-
-  for (u32 Index = 0;
-       Index < MaxPanels;
-       ++Index) {
-    if (!BCoderState.Panels[Index].Active)
-      continue;
-
-    if (!PanelsGraphicsWin32[Index].Context) {
-      PanelsGraphicsWin32[Index].Context = CreateCompatibleDC(0);
-    }
-
-    if (PanelsGraphicsWin32[Index].Bitmap) {
-      DeleteObject(PanelsGraphicsWin32[Index].Bitmap);
-    }
-
-    BCoderState.Panels[Index].DrawAreaWidth = Width * BCoderState.Panels[Index].ViewportWidth;
-    BCoderState.Panels[Index].DrawAreaHeight = Height * BCoderState.Panels[Index].ViewportHeight;
-
-    PanelsGraphicsWin32[Index].Bitmap = CreateCompatibleBitmap(DeviceContext, BCoderState.Panels[Index].DrawAreaWidth, BCoderState.Panels[Index].DrawAreaHeight);
-    SelectObject(PanelsGraphicsWin32[Index].Context, PanelsGraphicsWin32[Index].Bitmap);
-  }
+  CloseHandle(File);
+  return Data;
 }
 
-struct win32_draw_lines_context {
-  bool IsMultilineComment;
-  bool IsSelected;
-};
-
 internal void
-Win32DrawLineOfText(HDC DeviceContext, u32 ViewX, u32 PositionX, u32 PositionY, panel *Panel, char *LineStart, char *LineEnd, win32_draw_lines_context *DrawLinesCtx) {
-  Assert(LineStart != 0);
-  Assert(LineEnd != 0);
+Win32GetGlyphBitmap(const char *Filename, const char *FontName,
+                    int *Width, int *Height, int *OffsetX, int *OffsetY,
+                    char Codepoint, int FontSize,
+                    u32 *OutputBitmap,
+                    int OutputWidth, int OutputHeight) {
+  Assert(Width != 0);
+  Assert(Height != 0);
+  Assert(OffsetX != 0);
+  Assert(OffsetY != 0);
+  Assert(OutputBitmap != 0);
+  Assert(OutputWidth > 0);
+  Assert(OutputHeight > 0);
 
-  SIZE Size;
-  theme *Theme = &BCoderState.Theme;
-  char *Buffer = LineStart;
-  char *PositionInLine = LineStart;
-  u32 LineLength = LineEnd - LineStart + 1;
+  static void *Bits = 0;
+  static HDC DeviceContext = 0;
 
-  // NOTE(Brajan): in that order
-  bool IsComment = false;
-  bool IsString = false;
-  bool IsReadingWord = false;
-  bool IsPreprocesor = false;
-  char *WordStart = 0;
-
-  if (LineLength > 0 && Buffer[0] == '#')
-    IsPreprocesor = false;
-
-  u32 OffsetX = 0;
-  for (u32 Index = 0;
-       Index < LineLength;
-       ++Index) {
-#if 1
-    if (Buffer[Index] == '/' && Buffer[Index + 1] == '*' && !IsString) {
-      Win32DrawText(DeviceContext, PositionInLine, (Buffer + Index) - PositionInLine, PositionX + OffsetX, PositionY, Theme->Text);
-      GetTextExtentPoint32A(DeviceContext, PositionInLine, (Buffer + Index) - PositionInLine, &Size);
-      OffsetX += Size.cx;
-
-      PositionInLine = Buffer + Index;
-      Index += 2;
-      DrawLinesCtx->IsMultilineComment = true;
-      continue;
-    } else if (DrawLinesCtx->IsMultilineComment) {
-      if (Buffer[Index] == '*' && Buffer[Index + 1] == '/') {
-        Index += 2;
-        Win32DrawText(DeviceContext, PositionInLine, (Buffer + Index) - PositionInLine, PositionX + OffsetX, PositionY, Theme->Comment);
-        GetTextExtentPoint32A(DeviceContext, PositionInLine, (Buffer + Index) - PositionInLine, &Size);
-        OffsetX += Size.cx;
-
-        DrawLinesCtx->IsMultilineComment = false;
-        PositionInLine = Buffer + Index;
-      }
-      continue;
-    }
-
-    if (Buffer[Index] == '/' && Buffer[Index + 1] == '/') {
-      Win32DrawText(DeviceContext, PositionInLine, (Buffer + Index) - PositionInLine, PositionX + OffsetX, PositionY, Theme->Text);
-      GetTextExtentPoint32A(DeviceContext, PositionInLine, (Buffer + Index) - PositionInLine, &Size);
-      OffsetX += Size.cx;
-
-      Win32DrawText(DeviceContext, Buffer + Index, LineEnd - (Buffer + Index), PositionX + OffsetX, PositionY, Theme->Comment);
-      IsComment = true;
-      break;
-    } else if (Buffer[Index] == '"') {
-      if (!IsString) {
-        Win32DrawText(DeviceContext, PositionInLine, (Buffer + Index) - PositionInLine, PositionX + OffsetX, PositionY, Theme->Text);
-        GetTextExtentPoint32A(DeviceContext, PositionInLine, (Buffer + Index) - PositionInLine, &Size);
-        OffsetX += Size.cx;
-        
-        PositionInLine = Buffer + Index;
-        IsString = true;
-      } else {
-        Win32DrawText(DeviceContext, PositionInLine, (Buffer + Index) - PositionInLine + 1, PositionX + OffsetX, PositionY, Theme->String);
-        GetTextExtentPoint32A(DeviceContext, PositionInLine, (Buffer + Index) - PositionInLine + 1, &Size);
-        OffsetX += Size.cx;
-
-        PositionInLine = Buffer + Index + 1;
-        IsString = false;
-      }
-    }
-
-    if (IsPreprocesor)
-      continue;
+  if (!DeviceContext) {
+    AddFontResourceExA(Filename, FR_PRIVATE, 0);
+    int Height = FontSize; 
     
-    bool WasKeyword = false;
-    if ((!IsDelimiter(Buffer[Index]) && !IsWhitespace(Buffer[Index])) && !IsReadingWord) {
-      WordStart = Buffer + Index;
-      IsReadingWord = true;
-    } else if ((IsDelimiter(Buffer[Index]) || IsWhitespace(Buffer[Index])) && IsReadingWord) {
-      u32 WordLength = (Buffer + Index) - WordStart;
-      if (IsWordKeyword(WordStart, WordLength)) {
-        Win32DrawText(DeviceContext, PositionInLine, WordStart - PositionInLine, PositionX + OffsetX, PositionY, Theme->Text);
-        GetTextExtentPoint32A(DeviceContext, PositionInLine, WordStart - PositionInLine, &Size);
-        OffsetX += Size.cx;
+    HFONT Font = CreateFontA(Height, 0, 0, 0,
+                             FW_NORMAL,
+                             FALSE,
+                             FALSE,
+                             FALSE,
+                             DEFAULT_CHARSET,
+                             OUT_DEFAULT_PRECIS,
+                             CLIP_DEFAULT_PRECIS,
+                             //CLEARTYPE_QUALITY,
+                             ANTIALIASED_QUALITY,
+                             DEFAULT_PITCH | FF_DONTCARE,
+                             FontName);
+    //HFONT Font = CreateFont(FontSize, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, FontName);
 
-        Win32DrawText(DeviceContext, WordStart, WordLength, PositionX + OffsetX, PositionY, Theme->Keyword);
-        GetTextExtentPoint32A(DeviceContext, WordStart, WordLength, &Size);
-        OffsetX += Size.cx;
+#if 1
+    DeviceContext = CreateCompatibleDC(GetDC(0));
+    
+    BITMAPINFO BitmapInfo = {};
+    BitmapInfo.bmiHeader.biSize = sizeof(BitmapInfo.bmiHeader);
+    BitmapInfo.bmiHeader.biWidth = OutputWidth;
+    BitmapInfo.bmiHeader.biHeight = OutputHeight;
+    BitmapInfo.bmiHeader.biPlanes = 1;
+    BitmapInfo.bmiHeader.biBitCount = 32;
+    BitmapInfo.bmiHeader.biSizeImage = 0;
+    BitmapInfo.bmiHeader.biXPelsPerMeter = 0;
+    BitmapInfo.bmiHeader.biYPelsPerMeter = 0;
+    BitmapInfo.bmiHeader.biClrUsed = 0;
+    BitmapInfo.bmiHeader.biClrImportant = 0;
+    BitmapInfo.bmiHeader.biCompression = BI_RGB;
+    
+    HBITMAP Bitmap = CreateDIBSection(DeviceContext, &BitmapInfo, DIB_RGB_COLORS, &Bits, 0, 0);
+    SelectObject(DeviceContext, Bitmap);
+    SelectObject(DeviceContext, Font);
+    SetBkColor(DeviceContext, RGB(255, 255, 255));
 
-        PositionInLine = Buffer + Index;
-      } else if (IsConstant(WordStart, WordLength)) {
-        Win32DrawText(DeviceContext, PositionInLine, WordStart - PositionInLine, PositionX + OffsetX, PositionY, Theme->Text);
-        GetTextExtentPoint32A(DeviceContext, PositionInLine, WordStart - PositionInLine, &Size);
-        OffsetX += Size.cx;
+    TEXTMETRIC TextMetric;
+    GetTextMetrics(DeviceContext, &TextMetric);
+#endif
+#if 0
+    DeviceContext = CreateCompatibleDC(0);
+    HBITMAP Bitmap = CreateCompatibleBitmap(DeviceContext, OutputWidth, OutputHeight);
+    SelectObject(DeviceContext, Bitmap);
+    SelectObject(DeviceContext, Font);
+    SetBkColor(DeviceContext, RGB(0, 0, 0));
 
-        Win32DrawText(DeviceContext, WordStart, WordLength, PositionX + OffsetX, PositionY, Theme->Constant);
-        GetTextExtentPoint32A(DeviceContext, WordStart, WordLength, &Size);
-        OffsetX += Size.cx;
-
-        PositionInLine = Buffer + Index;
-      }
-      IsReadingWord = false;
-    }
+    TEXTMETRIC TextMetric;
+    GetTextMetrics(DeviceContext, &TextMetric);
 #endif
   }
 
-  if (DrawLinesCtx->IsMultilineComment) {
-    Win32DrawText(DeviceContext, PositionInLine, LineEnd - PositionInLine, PositionX + OffsetX, PositionY, Theme->Comment);
-  } else if (!IsComment) {
-    Win32DrawText(DeviceContext, PositionInLine, LineEnd - PositionInLine, PositionX + OffsetX, PositionY, Theme->Text);
-  }
-}
+  wchar_t CheesePoint = (wchar_t)Codepoint;
 
-internal void
-Win32DrawPanel(HDC DeviceContext, panel *Panel) {
-  theme *Theme = &BCoderState.Theme;
-  buffer *Buffer = Panel->Buffer;
-  bool IsActive = (Panel == BCoderState.CurrentPanel);
-
-  u32 Width = Panel->DrawAreaWidth;
-  u32 Height = Panel->DrawAreaHeight;
-  u32 PositionX = 0;
-  u32 PositionY = 0;
-
-  win32_draw_lines_context DrawLinesCtx;
-  DrawLinesCtx.IsMultilineComment = false;
-  DrawLinesCtx.IsSelected = false;
-
-  Win32DrawRectangle(DeviceContext, 0, 0, Width, Height, Theme->Background); 
-
-  if (BCoderState.ShowNumbers) {
-    char TempBuffer[16];
-    wsprintf(TempBuffer, "%d", GetLinesNumber(Buffer));
-
-    SIZE Size;
-    GetTextExtentPoint32A(DeviceContext, TempBuffer, StringLength(TempBuffer), &Size);
-    PositionX = Size.cx + 5;
-
-    Win32DrawRectangle(DeviceContext, 0, 0, PositionX, Height, Theme->StatusBarBackground);
-  }
-
-  char StatusBarString[512];
-  bool Saved = Buffer->Flags & BufferFlag_Saved;
-  if (Buffer->Flags & BufferFlag_NotSavable) {
-    Saved = true;
-  }
-  wsprintf(StatusBarString, "File: %s%c L:%d C:%d LL:%d [%s] DEBUG: CHAR: %c ASCII: %d", 
-           Buffer->Name,
-           (Saved ? ' ' : '*'),
-           GetLineNumberByPosition(Buffer, Panel->CursorPosition),
-           CalculateCursorPositionInLine(Buffer, Panel->CursorPosition),
-           GetLineLength(Buffer, GetLineNumberByPosition(Buffer, Panel->CursorPosition)),
-           (Buffer->LineEnding == LineEnding_Dos ? "dos" : "unix"),
-           *((char *)Buffer->Memory + Panel->CursorPosition),
-           *((char *)Buffer->Memory + Panel->CursorPosition));
-  if (IsActive) {
-    Win32DrawRectangle(DeviceContext, 0, 0, Width, BCoderState.LineHeight, Theme->StatusBarBackground);
-    Win32DrawText(DeviceContext, StatusBarString, lstrlenA(StatusBarString), 4, 0, Theme->StatusBarText);
-  } else {
-    Win32DrawRectangle(DeviceContext, 0, 0, Width, BCoderState.LineHeight, Theme->InactiveStatusBarBackground);
-    Win32DrawText(DeviceContext, StatusBarString, lstrlenA(StatusBarString), 4, 0, Theme->InactiveStatusBarText);
-  }
+  SIZE Size;
+  GetTextExtentPoint32W(DeviceContext, &CheesePoint, 1, &Size);
   
-  u32 MarginTop = BCoderState.LineHeight + 4;
+  *Width = Size.cx;
+  *Height = Size.cy;
+  *OffsetX = 0;
+  *OffsetY = 0;
 
-  u32 CursorScreenPosX = 0;
-  u32 CursorScreenPosY = 0;
-  u32 LineIndex = 0;
-  char *StartPosition = (char *)Buffer->Memory;
-  char *CurrentPosition = StartPosition + GetPositionWhereLineStarts(Buffer, Panel->ViewLine);
+  //PatBlt(DeviceContext, 0, 0, *Width, *Height, BLACKNESS);
+  //SetBkMode(DeviceContext, TRANSPARENT);
+  SetTextColor(DeviceContext, RGB(0, 0, 0));
 
-  u32 SelectionRectangleStartX = 0;
+  TextOutW(DeviceContext, 0, 0, &CheesePoint, 1);
 
-  u32 SelectStart = 0;
-  u32 SelectEnd = 0;
-  bool IsSelecting = false;
-
-  if (Panel->SelectStart > Panel->CursorPosition) {
-    SelectStart = Panel->CursorPosition;
-    SelectEnd = Panel->SelectStart;
-  } else {
-    SelectStart = Panel->SelectStart;
-    SelectEnd = Panel->CursorPosition;
-  }
-
-  u32 LineLength = 0;
-  u32 SelectionDrawStart = 0;
-  u32 LineStartGlobPosition = 0;
-  bool SelectionStartsHere = false;
-
-  if (Panel->ViewLine > GetLineNumberByPosition(Panel->Buffer, Panel->SelectStart)) {
-    SelectionStartsHere = false;
-    IsSelecting = true;
-    SelectionDrawStart = 0;
-  }
-
-  for (;;) {
-    if (Buffer->Length == 0)
-      break;
-
-    if (*CurrentPosition == '\0')
-      break;
-
-    if (LineIndex > GetMaxLinesOnPanel(Height, BCoderState.LineHeight))
-      break;
-
-    char *LineStart = CurrentPosition;
-    for (;;) {
-      if (StartPosition + Panel->CursorPosition == CurrentPosition) {
-        SIZE Size;
-        GetTextExtentPoint32A(DeviceContext, LineStart, CurrentPosition - LineStart, &Size);
-        CursorScreenPosX = Size.cx;
-      }
-
-      if (*CurrentPosition == '\0' || *CurrentPosition == '\n') {
-        break;
-      }
-      ++CurrentPosition;
+  for (int Y = 0; Y < *Height; ++Y) {
+    for (int X = 0; X < *Width; ++X) {
+      COLORREF Pixel = GetPixel(DeviceContext, X, Y);
+      u8 Gray = (u8)(Pixel & 0xFF);
+      u8 Alpha = 0xFF;
+      OutputBitmap[X + OutputWidth * Y] = ((GetRValue(Pixel) << 0) |
+                                           (GetGValue(Pixel) << 8) |
+                                           (GetBValue(Pixel) << 16) |
+                                           (Alpha << 24));
     }
-
-    if (BCoderState.ShowNumbers) {
-      char TempBuffer[16] = "0";
-      wsprintf(TempBuffer, "%d", LineIndex + Panel->ViewLine + 1);
-      Win32DrawText(DeviceContext, TempBuffer, lstrlenA(TempBuffer), 0, MarginTop + (LineIndex * BCoderState.LineHeight), Theme->InactiveStatusBarText);
-    }
-
-    if (Panel->Selecting) {
-      PositionY = MarginTop + (LineIndex * BCoderState.LineHeight);
-      LineLength = CurrentPosition - LineStart + 1;
-      SelectionDrawStart = 0;
-      LineStartGlobPosition = (u32)(LineStart - StartPosition);
-      SelectionStartsHere = false;
-
-      for (u32 Index = 0;
-           Index < LineLength;
-           ++Index) {
-        SIZE Size;
-        u32 GlobPosition = (u32)(LineStart + Index - StartPosition);
-        if (GlobPosition == SelectStart) {
-          GetTextExtentPoint32A(DeviceContext, LineStart, GlobPosition - LineStartGlobPosition, &Size);
-          SelectionDrawStart = Size.cx;
-          IsSelecting = true;
-          SelectionStartsHere = true;
-        }
-        
-        if (GlobPosition == SelectEnd) {
-          char *SelectionStartPtr = StartPosition + SelectStart;
-          char *SelectionEndPtr = LineStart + Index;
-          
-          if (LineStart > SelectionStartPtr)
-            SelectionStartPtr = LineStart;
-
-          GetTextExtentPoint32A(DeviceContext, SelectionStartPtr, SelectionEndPtr - SelectionStartPtr, &Size);
-          u32 SelectionDrawWidth = Size.cx;
-          Win32DrawRectangle(DeviceContext, SelectionDrawStart, PositionY, SelectionDrawWidth, BCoderState.LineHeight, Theme->Selection);
-          IsSelecting = false;
-          SelectionStartsHere = false;
-        }
-
-        if (Index == LineLength - 1 && IsSelecting) {
-          if (SelectionStartsHere) {
-            char *SelectionStartPtr = StartPosition + SelectStart;
-            GetTextExtentPoint32A(DeviceContext, SelectionStartPtr, CurrentPosition - SelectionStartPtr, &Size);
-          } else {
-            GetTextExtentPoint32A(DeviceContext, LineStart, CurrentPosition - LineStart, &Size);
-          }
-          u32 SelectionDrawWidth = Size.cx;
-          if (SelectionDrawWidth == 0)
-            SelectionDrawWidth = 2;
-          Win32DrawRectangle(DeviceContext, SelectionDrawStart, PositionY, SelectionDrawWidth, BCoderState.LineHeight, Theme->Selection);
-        }
-      }
-    }
-
-    Win32DrawLineOfText(DeviceContext, 0, PositionX, MarginTop + (LineIndex * BCoderState.LineHeight), Panel, LineStart, CurrentPosition, &DrawLinesCtx);
-
-    ++LineIndex;
-    ++CurrentPosition;
-  }
-
-  // cursor
-  if (!IsActive)
-    return;
-  if (!Panel->ShowCommandPrompt) {
-    u32 LineByPosition = GetLineNumberByPosition(Buffer, Panel->CursorPosition);
-    u32 LineOnScreen = LineByPosition - Panel->ViewLine;
-    CursorScreenPosY = MarginTop + (LineOnScreen * BCoderState.LineHeight);
-    Win32DrawRectangle(DeviceContext, CursorScreenPosX + PositionX, CursorScreenPosY, 2, BCoderState.LineHeight + 3, Theme->Cursor);
-  } else if (Panel->ShowCommandPrompt) {
-    Win32DrawRectangle(DeviceContext, 0, BCoderState.LineHeight + 1, Panel->DrawAreaWidth, BCoderState.LineHeight, Theme->StatusBarBackground);
-    
-    SIZE Size;
-    Win32DrawText(DeviceContext, (char *)Panel->CommandBuffer.Memory, Panel->CommandBuffer.Length, 4, MarginTop + 1, Theme->StatusBarText);
-    u32 CursorX = 0;
-    
-    char *Start = (char *)Panel->CommandBuffer.Memory;
-    char *CurrentPosition = Start;
-    for (;;) {
-      if (Start + Panel->CommandCursorPosition == CurrentPosition) {
-        GetTextExtentPoint32A(DeviceContext, Start, CurrentPosition - Start, &Size);
-        CursorX += Size.cx;
-        break;
-      }
-
-      if (*CurrentPosition == '\0' || *CurrentPosition == '\n') {
-        break;
-      }
-      ++CurrentPosition;
-    }
-
-    Win32DrawRectangle(DeviceContext, CursorX + 4, BCoderState.LineHeight, 2, MarginTop + 1, Theme->StatusBarText);
   }
 }
 
 internal void
-Win32UpdateWindow(HDC DeviceContext, u32 X, u32 Y, u32 Width, u32 Height) {
-  for (u32 Index = 0;
-       Index < ArrayCount(BCoderState.Panels);
-       ++Index) {
-    panel *Panel = &BCoderState.Panels[Index];
+Win32LoadFont(u32 FontSize, const char *Filename, u32 AtlasWidth, u32 AtlasHeight) {
+#if BCODER_RENDERER_OPENGL == 1
+  bitmap Atlas;
+  Atlas.Width = AtlasWidth;
+  Atlas.Height = AtlasHeight;
+  Atlas.BytesPerPixel = 4;
+  u32 AtlasMemorySize = Atlas.Width * Atlas.Height * Atlas.BytesPerPixel;
+  Atlas.Memory = VirtualAlloc(0, AtlasMemorySize, MEM_COMMIT, PAGE_READWRITE);
 
-    if (!Panel->Active)
-      continue;
+  // TODO(Brajan): fill atlas
+  u8 *FontFileContent = Win32GetFileContent(Filename);
 
-    Win32DrawPanel(PanelsGraphicsWin32[Index].Context, Panel);
-    BitBlt(DeviceContext, Panel->ViewportX * Width, Panel->ViewportY * Height, 
-           Panel->DrawAreaWidth, Panel->DrawAreaHeight,
-           PanelsGraphicsWin32[Index].Context, 0, 0, SRCCOPY);
+  if (FontFileContent == 0) {
+    Assert(false);
   }
+
+  u8 *MonoBitmap = (u8 *)VirtualAlloc(0, AtlasWidth * AtlasHeight, MEM_COMMIT, PAGE_READWRITE);
+  u32 *GlyphBitmap = (u32 *)VirtualAlloc(0, Atlas.Width * Atlas.Height * 4, MEM_COMMIT, PAGE_READWRITE);
+
+  int PackingPosX = 0;
+  int PackingPosY = 0;
+
+  for (int Index = 0; Index < GlyphsNumber; ++Index) {
+    int Width = 0;
+    int Height = 0;
+    int OffsetX = 0;
+    int OffsetY = 0;
+
+    Win32GetGlyphBitmap("c:/windows/fonts/LiberationMono-Regular.ttf", "Liberation Mono",
+    //Win32GetGlyphBitmap("c:/windows/fonts/Arial.ttf", "Arial",
+                        &Width, &Height, &OffsetX, &OffsetY,
+                        StartCharacter + Index, FontSize,
+                        GlyphBitmap,
+                        Atlas.Width, Atlas.Height);
+    
+    if (PackingPosX >= Atlas.Width) {
+      PackingPosX = 0;
+      PackingPosY += FontSize;
+    }
+
+    u32 *AtlasBitmap = (u32 *)Atlas.Memory;
+    for (int Y = 0; Y < Height; ++Y) {
+      for (int X = 0; X < Width; ++X) {
+        AtlasBitmap[(X + PackingPosX) + Atlas.Width * (Y + PackingPosY)] = GlyphBitmap[X + Atlas.Width * Y];
+
+        //MonoBitmap[(X + PackingPosX) + Atlas.Width * (Y + PackingPosY)] = GlyphMonoBitmap[X + Atlas.Width * Y];   
+      }
+    }
+
+    glyph *Glyph = &BCoderState.Font.Glyphs[Index];
+    Glyph->X0 = PackingPosX;
+    Glyph->Y0 = PackingPosY;
+    Glyph->X1 = PackingPosX + Width;
+    Glyph->Y1 = PackingPosY + Height;
+    Glyph->Width = Width;
+    Glyph->Height = Height;
+    Glyph->XAdvance = Width;
+    Glyph->XOffset = OffsetX;
+    Glyph->YOffset = OffsetY;
+
+    PackingPosX += Width;
+  }
+
+  VirtualFree(GlyphBitmap, 0, MEM_RELEASE);
+
+  /*u8 *Source = MonoBitmap;
+  u8 *Row = (u8 *)Atlas.Memory;
+  for (int Y = 0; Y < Atlas.Height; ++Y) {
+    u32 *Pixel = (u32 *)Row;
+    for (int X = 0; X < Atlas.Width; ++X) {
+      u8 Alpha = *Source++;
+      *Pixel++ = ((Alpha << 24) |
+                  (Alpha << 16) |
+                  (Alpha << 8)  |
+                  (Alpha << 0));
+    }
+    Row += Atlas.Width * Atlas.BytesPerPixel;
+  }*/
+
+  BCoderState.Font.Atlas = Atlas;
+  BCoderState.Font.Size = FontSize;
+  BCoderState.LineHeight = FontSize;
+
+  VirtualFree(FontFileContent, 0, MEM_RELEASE);
+  VirtualFree(MonoBitmap, 0, MEM_RELEASE);
+#elif BCODER_RENDERER_OS == 1
+  SetFontWin32(FontSize, Filename);
+#endif
 }
 
 internal bool
@@ -535,20 +370,6 @@ Win32FreeMemory(void *Ptr) {
   VirtualFree(Ptr, 0, MEM_RELEASE);
 }
 
-internal void
-Win32RecreatePanelsGraphics() {
-  SendMessage(Win32Window, WM_SIZE, 0, 0);
-}
-
-internal void
-Win32LoadSystemFont(u32 SizeInPixels, const char *FontName) {
-  if (Font) {
-    DeleteObject(Font);
-  }
-  Font = CreateFont(SizeInPixels, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, FontName);
-  BCoderState.LineHeight = SizeInPixels;
-}
-
 internal u32
 Win32GetAsyncKeysState() {
   u32 AsyncKeyFlags = AsyncKey_None;
@@ -648,9 +469,24 @@ Win32RunBuildFile(const char *Name, char *Buffer, u32 Size, u32 *OutSize) {
   return 0;
 }
 
+internal win32_window_dimensions
+Win32GetWindowDimensions(HWND Window) {
+  Assert(Window != 0);
+
+  RECT Rect = {};
+  win32_window_dimensions Dimensions;   
+  GetClientRect(Window, &Rect);
+  Dimensions.Width = Rect.right - Rect.left;
+  Dimensions.Height = Rect.bottom - Rect.top;
+  return Dimensions;
+}
+
 internal void
-Win32Redraw() {
-  RedrawWindow(Win32Window, NULL, NULL, RDW_INVALIDATE);
+Win32UpdatePanels() {
+#if BCODER_RENDERER_OPENGL == 1
+#elif BCODER_RENDERER_OS == 1
+  RecreatePanelsBitmapsWin32();
+#endif
 }
 
 internal LRESULT CALLBACK
@@ -658,10 +494,6 @@ WindowCallback(HWND Handle, UINT Message, WPARAM WParam, LPARAM LParam) {
   LRESULT Result = 0;
 
   switch (Message) {
-    case WM_QUIT: {
-      IsExitRequested = true;
-    } break;
-
     case WM_DESTROY: {
       IsExitRequested = true;
     } break;
@@ -671,16 +503,37 @@ WindowCallback(HWND Handle, UINT Message, WPARAM WParam, LPARAM LParam) {
     } break;
     
     case WM_SIZE: {
+      win32_window_dimensions WindowDimensions = Win32GetWindowDimensions(Handle);
+      BCoderState.WindowWidth = WindowDimensions.Width;
+      BCoderState.WindowHeight = WindowDimensions.Height;
+
+#if BCODER_RENDERER_OPENGL == 1
+#elif BCODER_RENDERER_OS == 1
       HDC DeviceContext = GetDC(Handle);
-      RECT Rect;
-      GetClientRect(Handle, &Rect);
-      u32 Width = Rect.right - Rect.left;
-      u32 Height = Rect.bottom - Rect.top;
-      Win32ResizeDIBSection(DeviceContext, Width, Height);
+      WindowResizedWin32(DeviceContext);
       ReleaseDC(Handle, DeviceContext);
+#endif
+
+      Win32UpdatePanels();
     } break;
 
-    case WM_SYSKEYDOWN:
+#if BCODER_RENDERER_OS == 1
+    case WM_PAINT: {
+      PAINTSTRUCT PaintStruct;
+      HDC DeviceContext;
+      DeviceContext = BeginPaint(Handle, &PaintStruct);
+      u32 X = PaintStruct.rcPaint.left;
+      u32 Y = PaintStruct.rcPaint.top;
+      u32 Width = PaintStruct.rcPaint.right - PaintStruct.rcPaint.left;
+      u32 Height = PaintStruct.rcPaint.bottom - PaintStruct.rcPaint.top;
+      
+      DrawBCoderWin32();
+
+      BitBlt(DeviceContext, 0, 0, Width, Height, Renderer.BackbufferDC, 0, 0, SRCCOPY);
+      EndPaint(Handle, &PaintStruct); 
+    } break;
+#endif
+
     case WM_KEYDOWN: {
       u32 AsyncKeyFlags = AsyncKey_None;
       if (GetAsyncKeyState(VK_CONTROL))
@@ -693,21 +546,7 @@ WindowCallback(HWND Handle, UINT Message, WPARAM WParam, LPARAM LParam) {
       HandleKeyDown((u32)WParam, AsyncKeyFlags);
     } break;
 
-    case WM_SYSKEYUP:
     case WM_KEYUP: {
-    } break;
-
-    case WM_PAINT: {
-      PAINTSTRUCT PaintStruct;
-      HDC DeviceContext;
-      DeviceContext = BeginPaint(Handle, &PaintStruct);
-      u32 X = PaintStruct.rcPaint.left;
-      u32 Y = PaintStruct.rcPaint.top;
-      u32 Width = PaintStruct.rcPaint.right - PaintStruct.rcPaint.left;
-      u32 Height = PaintStruct.rcPaint.bottom - PaintStruct.rcPaint.top;
-      Win32UpdateWindow(BackbufferDC, 0, 0, Width, Height);
-      BitBlt(DeviceContext, 0, 0, Width, Height, BackbufferDC, 0, 0, SRCCOPY);
-      EndPaint(Handle, &PaintStruct); 
     } break;
 
     case WM_CHAR: {
@@ -727,6 +566,7 @@ WinMain(HINSTANCE Instance,
         LPSTR     LpCmdLine,
         int       CmdShow) {
   // setup platform api
+  Platform.LoadFont = Win32LoadFont;
   Platform.ReadFileIntoBuffer = Win32ReadFileIntoBuffer;
   Platform.WriteBufferIntoFile = Win32WriteBufferIntoFile;
   Platform.ShowError = Win32ShowError;
@@ -736,59 +576,97 @@ WinMain(HINSTANCE Instance,
   Platform.SetSystemClipboard = Win32SetSystemClipboard;
   Platform.AllocateMemory = Win32AllocateMemory;
   Platform.FreeMemory = Win32FreeMemory;
-  Platform.RecreatePanelsGraphics = Win32RecreatePanelsGraphics;
-  Platform.LoadSystemFont = Win32LoadSystemFont;
   Platform.GetAsyncKeysState = Win32GetAsyncKeysState;
   Platform.RunBuildFile = Win32RunBuildFile;
-  Platform.Redraw = Win32Redraw;
+  Platform.UpdatePanels = Win32UpdatePanels;
 
   // initialize bcoder before creating win32 window
   InitializeBCoder();
 
-  // create win32 window
   WNDCLASS WindowClass = {};
-  WindowClass.style = CS_OWNDC | CS_HREDRAW | CS_VREDRAW;
-  WindowClass.cbClsExtra = 0;
-  WindowClass.cbWndExtra = 0;
+  WindowClass.style = CS_HREDRAW | CS_VREDRAW;
   WindowClass.lpszClassName = "bcoder_win32";
   WindowClass.hInstance = Instance;
-  WindowClass.hbrBackground = GetSysColorBrush(COLOR_3DFACE);
-  WindowClass.lpszMenuName = NULL;
   WindowClass.lpfnWndProc = &WindowCallback;
   WindowClass.hCursor = LoadCursor(NULL, IDC_ARROW);
-  WindowClass.hIcon = NULL;
+  WindowClass.hbrBackground = GetSysColorBrush(COLOR_3DFACE);
 
   RegisterClass(&WindowClass);
+    
+  Win32Window = CreateWindowEx(0,
+                               WindowClass.lpszClassName,
+                               "bcoder",
+                               WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+                               CW_USEDEFAULT,
+                               CW_USEDEFAULT,
+                               CW_USEDEFAULT, 
+                               CW_USEDEFAULT,
+                               0,
+                               0,
+                               Instance,
+                               0);
 
-  DWORD Flags = WS_VISIBLE;
-  Flags |= WS_CAPTION | WS_MINIMIZEBOX;
-  Flags |= WS_THICKFRAME | WS_MAXIMIZEBOX;
-  Flags |= WS_SYSMENU;
+#if BCODER_RENDERER_OPENGL == 1
+  OpenGLContext.DeviceContext = GetDC(Win32Window);
+  OpenGLContext.WindowHandle = Win32Window;
 
-  Win32Window = 
-    CreateWindowA("bcoder_win32", "bcoder",
-                  Flags,
-                  0, 0, 640, 480,
-                  NULL, NULL, Instance, NULL);
+  PIXELFORMATDESCRIPTOR PixelFormat = {};
+  PixelFormat.nSize = sizeof(PixelFormat);
+  PixelFormat.nVersion = 1;
+  PixelFormat.dwFlags = PFD_SUPPORT_OPENGL | PFD_DRAW_TO_WINDOW | PFD_DOUBLEBUFFER;
+  PixelFormat.cColorBits = 32;
+  PixelFormat.cAlphaBits = 8;
+  PixelFormat.iLayerType = PFD_MAIN_PLANE;
+  PixelFormat.iPixelType = PFD_TYPE_RGBA;
+  
+  int PixelFormatIndex = ChoosePixelFormat(OpenGLContext.DeviceContext, &PixelFormat);
+  PIXELFORMATDESCRIPTOR SuggestedPixelFormat;
+  DescribePixelFormat(OpenGLContext.DeviceContext, 
+                      PixelFormatIndex, 
+                      sizeof(SuggestedPixelFormat), 
+                      &SuggestedPixelFormat);
+  SetPixelFormat(OpenGLContext.DeviceContext, PixelFormatIndex, &SuggestedPixelFormat);
+
+  OpenGLContext.ContextHandle = wglCreateContext(OpenGLContext.DeviceContext);
+  wglMakeCurrent(OpenGLContext.DeviceContext, OpenGLContext.ContextHandle);
+ 
+  InitializeRenderer();
+#elif BCODER_RENDERER_OS == 1
+  InitializeRendererWin32();
+
+#endif
 
   ShowWindow(Win32Window, SW_MAXIMIZE);
   while (!IsExitRequested) {
     MSG Message;
-    while (PeekMessageW(&Message, NULL, 0, 0, PM_NOREMOVE)) {
-      if (!GetMessage(&Message, NULL, 0, 0)) {
-        break;
+
+    while (PeekMessage(&Message, 0, 0, 0, PM_REMOVE)) {
+      if (Message.message == WM_QUIT) {
+        IsExitRequested = true;
       }
 
-      DispatchMessage(&Message);
       TranslateMessage(&Message);
+      DispatchMessageA(&Message);
     }
 
-    Sleep(1000 / 60);
+#if BCODER_RENDERER_OPENGL == 1
+    DrawBCoderOpenGL();
+    SwapBuffers(OpenGLContext.DeviceContext);
+#elif BCODER_RENDERER_OS == 1
+    RedrawWindow(Win32Window, NULL, NULL, RDW_INVALIDATE);
+#endif
+
+    Sleep(32);
   }
-  
-  if (Font) {
-    DeleteObject(Font);
-  }
+
+
+#if BCODER_RENDERER_OPENGL == 1
+  wglMakeCurrent(OpenGLContext.DeviceContext, NULL);
+  wglDeleteContext(OpenGLContext.ContextHandle);
+  ReleaseDC(OpenGLContext.WindowHandle, OpenGLContext.DeviceContext);
+#elif BCODER_RENDERER_OS == 1
+  ShutdownRendererWin32();
+#endif
 
   ShutdownBCoder();
   return 0;

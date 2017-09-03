@@ -10,15 +10,16 @@ const char StartBufferContent[] = {
 
 void
 InitializeBCoder() {
-  Platform.LoadSystemFont(17, "Liberation Mono");
-  
+  //Platform.LoadSystemFont(17, "Liberation Mono");  
+  Platform.LoadFont(17, "c:/windows/fonts/LiberationMono-Regular.ttf", 1024, 1024);
+
   BCoderState.TabSize = 2;
   BCoderState.ShowNumbers = false;
   BCoderState.CurrentPanel = &BCoderState.Panels[0];
   BCoderState.CurrentPanel->CommandBuffer = Platform.CreateEmptyBuffer(Kilobytes(1));
-  //BCoderState.CurrentPanel->Buffer = GetBuffer("w:/test.c");
+  BCoderState.CurrentPanel->Buffer = GetBuffer("w:/test.c");
   
-#if 1
+#if 0
   BCoderState.CurrentPanel->Buffer = GetBuffer(StartBufferName);
   StringCopy(BCoderState.CurrentPanel->Buffer->Name, StartBufferName);
   StringCopy((char *)BCoderState.CurrentPanel->Buffer->Memory, StartBufferContent);
@@ -46,6 +47,8 @@ InitializeBCoder() {
   BCoderState.Theme.String = { 93, 105, 55 };
   BCoderState.Theme.Comment = { 61, 61, 61 };
   BCoderState.Theme.Constant = { 193, 147, 83 };
+  BCoderState.Theme.Preprocesor = { 0, 255, 32 };
+  BCoderState.Theme.Operator = { 16, 64, 222 };
 
   // key bindings
   Bind(0x26, AsyncKey_Ignore, Cmd_PrevLine);
@@ -84,6 +87,12 @@ InitializeBCoder() {
 
 void
 ShutdownBCoder() {
+  for (u32 Index = 0;
+       Index < MaxPanels;
+       ++Index) {
+    DestroyBitmap(&BCoderState.Panels[Index].Bitmap);
+  }
+
   for (u32 Index = 0;
        Index < MaxBuffers;
        ++Index) {
@@ -167,6 +176,24 @@ HandleKeyDown(u32 Key, u32 AsyncKeyFlags) {
         KeyBinding->Function(Panel);
       PanelUpdate(Panel);
     }
+  }
+}
+
+bitmap
+CreateBitmap(u32 Width, u32 Height, u32 BytesPerPixel) {
+  bitmap Bitmap;
+  Bitmap.Width = Width;
+  Bitmap.Height = Height;
+  Bitmap.BytesPerPixel = BytesPerPixel;
+  Bitmap.Memory = Platform.AllocateMemory(Bitmap.Width * Bitmap.Height * Bitmap.BytesPerPixel);
+  return Bitmap;
+}
+
+void
+DestroyBitmap(bitmap *Bitmap) {
+  if (Bitmap->Memory) {
+    Platform.FreeMemory(Bitmap->Memory);
+    Bitmap->Memory = 0;
   }
 }
 
@@ -846,7 +873,7 @@ CmdCloseAllOtherPanels(panel *Panel) {
     ZeroMemory(&BCoderState.Panels[Index], sizeof(panel));
     CloseBuffer(Buffer);
   }
-  Platform.RecreatePanelsGraphics();
+  Platform.UpdatePanels();
 }
 
 void
@@ -872,7 +899,8 @@ CmdSplitVertically(panel *Panel) {
   SplittedPanel->ViewportWidth = Panel->ViewportWidth;
   SplittedPanel->ViewportHeight = Panel->ViewportHeight;
 
-  Platform.RecreatePanelsGraphics();
+  //Platform.RecreatePanelsGraphics();
+  Platform.UpdatePanels();
 }
 
 void
@@ -898,7 +926,8 @@ CmdSplitHorizontally(panel *Panel) {
   SplittedPanel->ViewportWidth = Panel->ViewportWidth;
   SplittedPanel->ViewportHeight = Panel->ViewportHeight;
 
-  Platform.RecreatePanelsGraphics();
+  //Platform.RecreatePanelsGraphics();
+  Platform.UpdatePanels();
 }
 
 void
@@ -1245,145 +1274,6 @@ CmdRedo(panel *Panel) {
   // ...
 }
 
-// TODO(Brajan): make syntax higlighting for more languages
-static char Keywords[][24] = {
-  "alignas",
-  "alignof",
-  "and",
-  "and_eq",
-  "asm",
-  "auto",
-  "bitand",
-  "bitor",
-  "bool",
-  "break",
-  "case",
-  "catch",
-  "char",
-  "char16_t",
-  "char32_t",
-  "class",
-  "compl",
-  "const",
-  "constexpr",
-  "const_cast",
-  "continue",
-  "decltype",
-  "default",
-  "delete",
-  "do",
-  "double",
-  "dynamic_cast",
-  "else",
-  "enum",
-  "explicit",
-  "export",
-  "extern",
-  "false",
-  "false",
-  "float",
-  "for",
-  "friend",
-  "goto",
-  "if",
-  "inline",
-  "int",
-  "long",
-  "mutable",
-  "namespace",
-  "new",
-  "noexcept",
-  "not",
-  "not_eq",
-  "nullptr",
-  "operator",
-  "or",
-  "or_eq",
-  "private",
-  "protected",
-  "public",
-  "register",
-  "reinterpret_cast",
-  "return",
-  "short",
-  "signed",
-  "sizeof",
-  "static",
-  "static_assert",
-  "static_cast",
-  "struct",
-  "switch",
-  "template",
-  "this",
-  "thread_local",
-  "throw",
-  "true",
-  "try",
-  "typedef",
-  "typeid",
-  "typename",
-  "union",
-  "unsigned",
-  "using",
-  "virtual",
-  "volatile",
-  "void",
-  "wchar_t",
-  "while",
-  "xor",
-  "xor_eq"
-};
-
-bool
-IsWordKeyword(const char *Word, u32 Length) {
-  for (u32 Index = 0;
-       Index < ArrayCount(Keywords);
-       ++Index) {
-    if (Length == StringLength(Keywords[Index])) {
-      if (StringCompareLength(Word, Keywords[Index], Length) == 0)
-        return true;
-    }
-  }
-  return false;
-}
-
-// TODO(Brajan): rename that maybe to IsDelimiter? I dont know, need to think about that
-bool
-IsDelimiter(char Character) {
-  switch (Character) {
-    case '+':
-    case '-':
-    case '*':
-    case '/':
-    case '=':
-    case '%':
-    case '!':
-    case '>':
-    case '<':
-    case '&':
-    case '|':
-    case '~':
-    case '^':
-    case '[':
-    case ']':
-    case '(':
-    case ')':
-    case '?':
-    case ':':
-    case ';':
-    case ',':
-    case '.':
-    case '{':
-    case '}':
-      return true; 
-      break;
-    default:
-      return false;
-      break;
-  }
-  return false;
-}
-
 bool
 IsWhitespace(char Character) {
   switch (Character) {
@@ -1534,7 +1424,7 @@ GetNumberOfOpenPanels() {
 
 void
 PanelUpdate(panel *Panel) {
-  Platform.Redraw();
+  //DrawPanel(Panel);
 }
 
 void

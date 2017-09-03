@@ -21,11 +21,21 @@ typedef double r64;
 #endif
 
 #ifndef ZeroMemory
-internal void
+static void
 ZeroMemory(void *Buffer, u32 Size) {
   s8 *Pointer = (i8 *)Buffer;
   while (Size--)
     *(Pointer++) = 0;
+}
+#endif
+
+#ifndef MemoryCopy
+static void
+MemoryCopy(void *Source, void *Destination, int Size) {
+  char *S = (char *)Source;
+  char *D = (char *)Destination;
+  while (Size--)
+    *D++ = *S++;
 }
 #endif
 
@@ -44,8 +54,37 @@ ZeroMemory(void *Buffer, u32 Size) {
 #define BuildBufferName "~~ BUILD RESULT ~~"
 #define StartBufferName "~~ Start ~~"
 
+#define StartCharacter 32
+#define GlyphsNumber 96
+
+struct bitmap {
+  void *Memory;
+  int Width;
+  int Height;
+  int BytesPerPixel;
+  int Pitch;
+};
+
+struct glyph {
+  int X0, Y0;
+  int X1, Y1;
+  int Width, Height;
+  int XAdvance;
+  int XOffset, YOffset;
+};
+
+struct font {
+  bitmap Atlas;
+  glyph Glyphs[GlyphsNumber];
+  int Size;
+};
+
 struct rgb {
   u8 Red, Green, Blue;
+};
+
+struct rgba {
+  u8 Red, Green, Blue, Alpha;
 };
 
 struct theme {
@@ -61,6 +100,8 @@ struct theme {
   rgb String;
   rgb Comment;
   rgb Constant;
+  rgb Preprocesor;
+  rgb Operator;
 };
 
 enum buffer_flags {
@@ -106,20 +147,13 @@ global_variable const char *BuiltInCommands[] = {
   "jumpto" // jump to line
 };
 
-/*enum panel_cmd {
-  PanelCmd_Unknown,
-  PanelCmd_EditFile,
-  PanelCmd_JumpToLine,
-  PanelCmd_Max
-};*/
-
 global_variable const char *PanelCmdLabels[] = {
   "unknown",
   "edit file",
   "jump to line"
 };
 
-// TODO(Brajan): caching
+// TODO(Brajan): cache more data
 struct panel {
   bool Active;
   buffer *Buffer;
@@ -130,6 +164,7 @@ struct panel {
   r32 ViewportHeight;
   // NOTE(Brajan): in pixels, calculations based
   // on viewport values
+  bitmap Bitmap;
   u32 DrawAreaWidth;
   u32 DrawAreaHeight;
   u32 ViewLine;
@@ -200,6 +235,9 @@ struct buffer_state {
 };
 
 struct bcoder_state {
+  int WindowWidth;
+  int WindowHeight;
+  font Font;
   theme Theme;
   u32 LineHeight;
   buffer_state Buffers[MaxBuffers];
@@ -219,6 +257,9 @@ void InitializeBCoder();
 void ShutdownBCoder();
 void ProcessInput(char Input);
 void HandleKeyDown(u32 Key, u32 AsyncKeyFlags);
+
+bitmap CreateBitmap(u32 Width, u32 Height, u32 BytesPerPixel);
+void DestroyBitmap(bitmap *Bitmap);
 
 buffer *GetBuffer(const char *Filename);
 void CloseBuffer(buffer *Buffer);
@@ -258,8 +299,6 @@ void CmdPrevWord(panel *Panel);
 void CmdUndo(panel *Panel);
 void CmdRedo(panel *Panel);
 
-bool IsWordKeyword(const char *Word, u32 Length);
-bool IsDelimiter(char Character);
 bool IsWhitespace(char Character);
 bool IsConstant(const char *Start, u32 Length);
 
@@ -291,6 +330,7 @@ u32 GetLinesNumber(buffer *Buffer);
 void AddInsertHistory(buffer *Buffer, u32 Position, u32 Length);
 
 struct platform {
+  void (*LoadFont)(u32 FontSize, const char *FileName, u32 AtlasWidth, u32 AtlasHeight);
   bool (*ReadFileIntoBuffer)(const char *FileName, buffer *Buffer);
   void (*WriteBufferIntoFile)(buffer* Buffer, const char *FileName);
   void (*ShowError)(const char *Error);
@@ -300,11 +340,9 @@ struct platform {
   void (*SetSystemClipboard)(const char *Data, u32 Length);
   void *(*AllocateMemory)(u32 Size);
   void (*FreeMemory)(void *Ptr);
-  void (*RecreatePanelsGraphics)();
-  void (*LoadSystemFont)(u32 SizeInPixels, const char *FontName);
   u32 (*GetAsyncKeysState)();
   u32 (*RunBuildFile)(const char *Name, char *Buffer, u32 Size, u32 *OutSize);
-  void (*Redraw)();
+  void (*UpdatePanels)();
 };
 global_variable platform Platform;
 
